@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="robots" content="noindex, nofollow">
+<title>資料の閲覧</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans+JP:wght@400;500;600;700&display=swap">
+<style id="gate-style">
+/* ログイン画面だけのスタイル。ログイン後に取り除く */
+:root { color-scheme: light; }
+html, body { margin: 0; background: #f6f7f9; }
+#gate {
+  min-height: 100vh; display: grid; place-items: center; padding: 24px max(20px, env(safe-area-inset-left, 0px));
+  font-family: "IBM Plex Sans JP", "Hiragino Sans", "Yu Gothic", "Meiryo", system-ui, sans-serif; color: #111827;
+}
+#gate form {
+  width: min(100%, 380px); background: #fff; border: 1px solid #e5e7eb; border-radius: 16px; padding: 32px 28px;
+  box-shadow: 0 1px 2px rgba(17, 24, 39, 0.04), 0 8px 24px rgba(17, 24, 39, 0.06); display: grid; gap: 18px;
+}
+#gate h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: -0.01em; }
+#gate p { margin: 0; font-size: 13px; color: #6b7280; line-height: 1.7; }
+#gate label { display: grid; gap: 6px; font-size: 13px; font-weight: 500; color: #374151; }
+#gate input {
+  font: inherit; font-size: 15px; padding: 10px 12px; border: 1px solid #d1d5db; border-radius: 10px; color: #111827; background: #fff;
+}
+#gate input:focus-visible, #gate button:focus-visible { outline: 2px solid #2563eb; outline-offset: 2px; }
+#gate button {
+  font: inherit; font-size: 15px; font-weight: 600; padding: 11px 16px; border: 0; border-radius: 10px;
+  background: #111827; color: #fff; cursor: pointer;
+}
+#gate button[disabled] { opacity: 0.6; cursor: wait; }
+#gate .error { color: #b91c1c; font-size: 13px; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<main id="gate">
+  <form id="login" autocomplete="on">
+    <div style="display:grid;gap:6px">
+      <h1>資料の閲覧</h1>
+      <p>関係者向けの資料です。お知らせしたIDとパスワードを入れてください。</p>
+    </div>
+    <label for="gate-id">ID<input id="gate-id" name="username" autocomplete="username" required></label>
+    <label for="gate-pw">パスワード<input id="gate-pw" name="password" type="password" autocomplete="current-password" required></label>
+    <div class="error" id="gate-error" role="alert"></div>
+    <button type="submit" id="gate-submit">開く</button>
+  </form>
+</main>
+<script>
+// 中身は同じフォルダの暗号化ファイル（*.bin）にあり、IDとパスワードから作った鍵でしか復号できない（PBKDF2-SHA256 → AES-256-GCM、gzip圧縮済み）
+const b64 = (s) => Uint8Array.from(atob(s), (c) => c.charCodeAt(0));
+
+async function deriveKey(id, pw, meta) {
+  const base = await crypto.subtle.importKey("raw", new TextEncoder().encode(`${id}\n${pw}`), "PBKDF2", false, ["deriveKey"]);
+  return crypto.subtle.deriveKey(
+    { name: "PBKDF2", salt: b64(meta.salt), iterations: meta.iter, hash: "SHA-256" },
+    base, { name: "AES-GCM", length: 256 }, false, ["decrypt"]);
+}
+
+async function decryptFile(key, file) {
+  const buf = new Uint8Array(await (await fetch(file)).arrayBuffer());
+  const plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv: buf.slice(0, 12) }, key, buf.slice(12));
+  const stream = new Blob([plain]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Response(stream).text();
+}
+
+// 復号したページ（title・link・style・本文・script）を、この文書に組み込んで動かす
+function mountPage(html) {
+  const tpl = document.createElement("template");
+  tpl.innerHTML = html;
+  const frag = tpl.content;
+  const title = frag.querySelector("title");
+  if (title) document.title = title.textContent;
+  frag.querySelectorAll("title, meta").forEach((n) => n.remove());
+  frag.querySelectorAll("link, style").forEach((n) => document.head.appendChild(n));
+  const scripts = [...frag.querySelectorAll("script")];
+  scripts.forEach((s) => s.remove());
+  document.getElementById("gate").remove();
+  document.getElementById("gate-style").remove();
+  document.body.appendChild(frag);
+  for (const s of scripts) {
+    const n = document.createElement("script");
+    n.textContent = s.textContent;
+    document.body.appendChild(n);
+  }
+  if (location.hash) document.getElementById(location.hash.slice(1))?.scrollIntoView();
+}
+
+document.getElementById("login").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const err = document.getElementById("gate-error"), btn = document.getElementById("gate-submit");
+  err.textContent = "";
+  btn.disabled = true;
+  btn.textContent = "確認しています…";
+  try {
+    const meta = await (await fetch("meta.json", { cache: "no-store" })).json();
+    const key = await deriveKey(document.getElementById("gate-id").value.trim(), document.getElementById("gate-pw").value, meta);
+    let html;
+    try {
+      html = await decryptFile(key, meta.files.page);
+    } catch {
+      throw new Error("IDまたはパスワードが違います。もう一度入れてください。");
+    }
+    // レビュー本文は大きいので、ページを先に表示し、裏で復号して渡す
+    window.__kawasuiData = Object.fromEntries(
+      Object.entries(meta.files.data).map(([name, file]) => [name, decryptFile(key, file).then(JSON.parse)]));
+    mountPage(html);
+  } catch (ex) {
+    err.textContent = ex.message.startsWith("IDまたは") ? ex.message : "読み込みに失敗しました。通信状態を確かめて、もう一度お試しください。";
+    btn.disabled = false;
+    btn.textContent = "開く";
+  }
+});
+</script>
+</body>
+</html>
